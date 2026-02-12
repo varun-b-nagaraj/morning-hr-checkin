@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from PIL import Image
 from supabase import create_client, Client
 from zoneinfo import ZoneInfo
-
+# Config
 APP_DIR = Path(__file__).parent.resolve()
 ENV_DIR = APP_DIR / ".env"
 ENV_PATH = ENV_DIR / "supabase.env"
