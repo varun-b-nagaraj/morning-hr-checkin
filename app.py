@@ -7,7 +7,7 @@ from pathlib import Path
 
 from flask import (
     Flask, jsonify, render_template, request,
-    redirect, url_for, session, send_file
+    redirect, url_for, session, send_file, make_response
 )
 from dotenv import load_dotenv
 from PIL import Image
@@ -86,27 +86,104 @@ def require_supabase_data(result, context: str):
 
 def fetch_students():
     client, _ = get_supabase_client()
-    result = client.table("students").select("name, s_number").order("name").execute()
-    return require_supabase_data(result, "students select failed")
+    page_size = 1000
+    rows = []
+    start = 0
+    while True:
+        result = (
+            client.table("students")
+            .select("name, s_number")
+            .order("name")
+            .range(start, start + page_size - 1)
+            .execute()
+        )
+        batch = require_supabase_data(result, "students select failed")
+        if not batch:
+            break
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        start += page_size
+    return rows
 
 
 def fetch_attendance_for_date(date_str: str):
     client, _ = get_supabase_client()
     date_str = normalize_date_string(date_str)
-    result = (
-        client.table("attendance")
-        .select("s_number, name, checkin_ts, photo_path")
-        .eq("checkin_date", date_str)
-        .order("checkin_ts")
-        .execute()
-    )
-    return require_supabase_data(result, "attendance select failed")
+    page_size = 1000
+    rows = []
+    start = 0
+    while True:
+        result = (
+            client.table("attendance")
+            .select("s_number, name, checkin_ts, photo_path")
+            .eq("checkin_date", date_str)
+            .order("checkin_ts")
+            .range(start, start + page_size - 1)
+            .execute()
+        )
+        batch = require_supabase_data(result, "attendance select failed")
+        if not batch:
+            break
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        start += page_size
+    return rows
 
 
 def fetch_attendance_basic():
     client, _ = get_supabase_client()
-    result = client.table("attendance").select("s_number, checkin_date").execute()
-    return require_supabase_data(result, "attendance analytics select failed")
+    page_size = 1000
+    rows = []
+    start = 0
+    while True:
+        result = (
+            client.table("attendance")
+            .select("s_number, checkin_date")
+            .order("checkin_date", desc=True)
+            .order("s_number")
+            .range(start, start + page_size - 1)
+            .execute()
+        )
+        batch = require_supabase_data(result, "attendance analytics select failed")
+        if not batch:
+            break
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        start += page_size
+    return rows
+
+
+def fetch_attendance_rows(date_from: str = "", date_to: str = ""):
+    client, _ = get_supabase_client()
+    date_from = normalize_date_string(date_from)
+    date_to = normalize_date_string(date_to)
+
+    page_size = 1000
+    rows = []
+    start = 0
+    while True:
+        query = client.table("attendance").select("s_number, name, checkin_ts, checkin_date, photo_path")
+        if date_from:
+            query = query.gte("checkin_date", date_from)
+        if date_to:
+            query = query.lte("checkin_date", date_to)
+        query = (
+            query.order("checkin_date", desc=True)
+            .order("checkin_ts")
+            .range(start, start + page_size - 1)
+        )
+        result = query.execute()
+        batch = require_supabase_data(result, "attendance select failed")
+        if not batch:
+            break
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        start += page_size
+    return rows
 
 
 def get_today_str():
@@ -177,8 +254,16 @@ def calculate_analytics(students, attendance_rows, available_dates):
         for student in students
     }
 
+    seen = set()
     for row in attendance_rows:
         s_num = str(row.get("s_number", "")).strip()
+        date_str = normalize_date_string(row.get("checkin_date") or "")
+        if not s_num or not date_str:
+            continue
+        key = (s_num, date_str)
+        if key in seen:
+            continue
+        seen.add(key)
         if s_num in student_records:
             student_records[s_num]["present_count"] += 1
 
@@ -205,6 +290,214 @@ def calculate_analytics(students, attendance_rows, available_dates):
         "avg_attendance": avg_attendance,
         "students": students_list,
     }
+
+
+def _parse_csv_set(value: str):
+    items = (value or "").split(",")
+    return {item.strip().lower() for item in items if item.strip()}
+
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _parse_date_param(value: str, field_name: str):
+    text = normalize_date_string(value)
+    if not text:
+        return ""
+    if not _DATE_RE.match(text):
+        raise ValueError(f"Invalid {field_name}. Expected YYYY-MM-DD.")
+    return text
+
+
+def _check_api_token():
+    expected = os.getenv("API_TOKEN") or os.getenv("REPORT_API_TOKEN") or ""
+    if not expected:
+        return True
+    auth = (request.headers.get("Authorization") or "").strip()
+    provided = ""
+    if auth.lower().startswith("bearer "):
+        provided = auth[7:].strip()
+    if not provided:
+        provided = (request.args.get("token") or "").strip()
+    return provided == expected
+
+
+def _maybe_add_cors(resp):
+    allowed = (os.getenv("CORS_ALLOW_ORIGIN") or "").strip()
+    if not allowed:
+        return resp
+    resp.headers["Access-Control-Allow-Origin"] = allowed
+    resp.headers["Access-Control-Allow-Methods"] = "GET,OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Authorization,Content-Type"
+    return resp
+
+
+@app.route("/api/report", methods=["GET", "OPTIONS"])
+def api_report():
+    if request.method == "OPTIONS":
+        return _maybe_add_cors(make_response(("", 204)))
+
+    if not _check_api_token():
+        return _maybe_add_cors(jsonify({"ok": False, "error": "unauthorized"})), 401
+
+    exclude = _parse_csv_set(request.args.get("exclude", ""))
+    date_str = request.args.get("date", "")
+    date_from = request.args.get("from", "")
+    date_to = request.args.get("to", "")
+
+    try:
+        date_str = _parse_date_param(date_str, "date")
+        date_from = _parse_date_param(date_from, "from")
+        date_to = _parse_date_param(date_to, "to")
+    except ValueError as exc:
+        return _maybe_add_cors(jsonify({"ok": False, "error": str(exc)})), 400
+
+    if date_str:
+        date_from = date_str
+        date_to = date_str
+    elif date_from and not date_to:
+        date_to = date_from
+    elif date_to and not date_from:
+        date_from = date_to
+
+    if date_from and date_to and date_from > date_to:
+        return _maybe_add_cors(jsonify({"ok": False, "error": "Invalid date range: from must be <= to."})), 400
+
+    include_photos = "photos" not in exclude and "photo" not in exclude
+    include_formatted_ts = "formatted_timestamps" not in exclude and "timestamps" not in exclude and "times" not in exclude
+    include_absent_lists = "absent" not in exclude and "absences" not in exclude
+
+    include_roster = "roster" not in exclude and "students" not in exclude
+    include_dates = "dates" not in exclude
+    include_attendance_rows = "attendance_rows" not in exclude and "attendance" not in exclude
+    include_sessions = "sessions" not in exclude
+    include_analytics = "analytics" not in exclude
+
+    # Fetch core data needed for any calculations.
+    roster = fetch_students()
+    attendance_rows = fetch_attendance_rows(date_from=date_from, date_to=date_to)
+
+    available_dates = sorted(
+        {normalize_date_string(row.get("checkin_date")) for row in attendance_rows if row.get("checkin_date")},
+        reverse=True,
+    )
+    if not available_dates and date_from and date_to and date_from == date_to:
+        available_dates = [date_from]
+
+    roster_ids = {str(s.get("s_number", "")).strip() for s in roster if s.get("s_number")}
+
+    # Flat attendance rows (normalized for API)
+    api_attendance_rows = []
+    if include_attendance_rows:
+        for row in attendance_rows:
+            s_num = str(row.get("s_number", "")).strip()
+            checkin_date = normalize_date_string(row.get("checkin_date") or "")
+            if not checkin_date:
+                continue
+            item = {
+                "s_number": s_num,
+                "name": row.get("name") or "",
+                "checkin_date": checkin_date,
+                "checkin_ts": row.get("checkin_ts") or "",
+            }
+            if include_formatted_ts:
+                item["checkin_ts_local"] = format_timestamp(row.get("checkin_ts"))
+            if include_photos:
+                item["photo_url"] = row.get("photo_path") or ""
+            api_attendance_rows.append(item)
+
+    # Sessions (grouped by date)
+    sessions = []
+    if include_sessions:
+        by_date = {}
+        for row in attendance_rows:
+            d = normalize_date_string(row.get("checkin_date") or "")
+            if not d:
+                continue
+            by_date.setdefault(d, []).append(row)
+
+        for d in available_dates:
+            present = []
+            present_ids = set()
+            unmatched = []
+            for row in by_date.get(d, []):
+                s_num = str(row.get("s_number", "")).strip()
+                present_ids.add(s_num)
+                rec = {
+                    "s_number": s_num,
+                    "name": row.get("name") or "",
+                    "checkin_ts": row.get("checkin_ts") or "",
+                }
+                if include_formatted_ts:
+                    rec["checkin_ts_local"] = format_timestamp(row.get("checkin_ts"))
+                if include_photos:
+                    rec["photo_url"] = row.get("photo_path") or ""
+                present.append(rec)
+                if s_num and s_num not in roster_ids:
+                    unmatched.append(rec)
+
+            present_roster_ids = {s for s in present_ids if s in roster_ids}
+            absent_ids = roster_ids - present_roster_ids
+            total_students = len(roster_ids)
+            present_count = len(present_roster_ids)
+            absent_count = len(absent_ids)
+            attendance_rate = (present_count / total_students * 100) if total_students else 0
+
+            session_obj = {
+                "date": d,
+                "present_count": present_count,
+                "absent_count": absent_count,
+                "total_students": total_students,
+                "attendance_rate": attendance_rate,
+                "present": present,
+            }
+
+            if include_absent_lists:
+                absent_list = []
+                for student in roster:
+                    s_num = str(student.get("s_number", "")).strip()
+                    if s_num and s_num in absent_ids:
+                        absent_list.append({
+                            "s_number": s_num,
+                            "name": student.get("name") or "",
+                        })
+                absent_list.sort(key=lambda x: x.get("name") or "")
+                session_obj["absent"] = absent_list
+
+            if unmatched:
+                session_obj["unmatched_attendance"] = unmatched
+
+            sessions.append(session_obj)
+
+    analytics = None
+    if include_analytics:
+        analytics = calculate_analytics(roster, attendance_rows, available_dates)
+
+    payload = {
+        "ok": True,
+        "meta": {
+            "generated_at": datetime.now(ZoneInfo("America/Chicago")).isoformat(),
+            "timezone": "America/Chicago",
+            "filters": {
+                "date": date_str or "",
+                "from": date_from or "",
+                "to": date_to or "",
+                "exclude": sorted(exclude),
+            },
+        },
+    }
+    if include_dates:
+        payload["dates"] = available_dates
+    if include_roster:
+        payload["roster"] = [{"name": s.get("name") or "", "s_number": str(s.get("s_number") or "")} for s in roster]
+    if include_attendance_rows:
+        payload["attendance_rows"] = api_attendance_rows
+    if include_sessions:
+        payload["sessions"] = sessions
+    if include_analytics:
+        payload["analytics"] = analytics
+
+    return _maybe_add_cors(jsonify(payload))
 
 
 @app.route("/", methods=["GET"])
