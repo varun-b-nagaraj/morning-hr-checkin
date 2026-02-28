@@ -7,7 +7,7 @@ from pathlib import Path
 
 from flask import (
     Flask, jsonify, render_template, request,
-    redirect, url_for, session, send_file, make_response
+    redirect, url_for, session, send_file
 )
 from dotenv import load_dotenv
 from PIL import Image
@@ -309,37 +309,8 @@ def _parse_date_param(value: str, field_name: str):
     return text
 
 
-def _check_api_token():
-    expected = os.getenv("API_TOKEN") or os.getenv("REPORT_API_TOKEN") or ""
-    if not expected:
-        return True
-    auth = (request.headers.get("Authorization") or "").strip()
-    provided = ""
-    if auth.lower().startswith("bearer "):
-        provided = auth[7:].strip()
-    if not provided:
-        provided = (request.args.get("token") or "").strip()
-    return provided == expected
-
-
-def _maybe_add_cors(resp):
-    allowed = (os.getenv("CORS_ALLOW_ORIGIN") or "").strip()
-    if not allowed:
-        return resp
-    resp.headers["Access-Control-Allow-Origin"] = allowed
-    resp.headers["Access-Control-Allow-Methods"] = "GET,OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Authorization,Content-Type"
-    return resp
-
-
-@app.route("/api/report", methods=["GET", "OPTIONS"])
+@app.route("/api/report", methods=["GET"])
 def api_report():
-    if request.method == "OPTIONS":
-        return _maybe_add_cors(make_response(("", 204)))
-
-    if not _check_api_token():
-        return _maybe_add_cors(jsonify({"ok": False, "error": "unauthorized"})), 401
-
     exclude = _parse_csv_set(request.args.get("exclude", ""))
     date_str = request.args.get("date", "")
     date_from = request.args.get("from", "")
@@ -350,7 +321,7 @@ def api_report():
         date_from = _parse_date_param(date_from, "from")
         date_to = _parse_date_param(date_to, "to")
     except ValueError as exc:
-        return _maybe_add_cors(jsonify({"ok": False, "error": str(exc)})), 400
+        return jsonify({"ok": False, "error": str(exc)}), 400
 
     if date_str:
         date_from = date_str
@@ -361,7 +332,7 @@ def api_report():
         date_from = date_to
 
     if date_from and date_to and date_from > date_to:
-        return _maybe_add_cors(jsonify({"ok": False, "error": "Invalid date range: from must be <= to."})), 400
+        return jsonify({"ok": False, "error": "Invalid date range: from must be <= to."}), 400
 
     include_photos = "photos" not in exclude and "photo" not in exclude
     include_formatted_ts = "formatted_timestamps" not in exclude and "timestamps" not in exclude and "times" not in exclude
@@ -497,7 +468,7 @@ def api_report():
     if include_analytics:
         payload["analytics"] = analytics
 
-    return _maybe_add_cors(jsonify(payload))
+    return jsonify(payload)
 
 
 @app.route("/", methods=["GET"])
