@@ -11,7 +11,9 @@ from flask import (
 )
 from dotenv import load_dotenv
 from PIL import Image
-from supabase import create_client, Client
+import hmac
+import psycopg
+from psycopg.rows import dict_row
 from zoneinfo import ZoneInfo
 # Config
 APP_DIR = Path(__file__).parent.resolve()
@@ -19,6 +21,8 @@ ENV_DIR = APP_DIR / ".env"
 ENV_PATH = ENV_DIR / "supabase.env"
 if ENV_PATH.exists():
     load_dotenv(ENV_PATH)
+if (ENV_DIR / "neon.env").exists():
+    load_dotenv(ENV_DIR / "neon.env")
 # update from system env as well
 SUPABASE_PHOTOS_BUCKET = os.getenv("SUPABASE_PHOTOS_BUCKET", "checkin-photos")
 _supabase_client = None
@@ -47,9 +51,33 @@ def get_supabase_client():
     if not supabase_url or not supabase_key:
         raise RuntimeError("Supabase not configured. Set SUPABASE_URL and SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY.")
 
+    from supabase import create_client  # only needed for photo uploads
+
     _supabase_url = supabase_url
     _supabase_client = create_client(supabase_url, supabase_key)
     return _supabase_client, _supabase_url
+
+
+# ---- Postgres (Neon). Supabase is only used for photo storage now.
+def db_query(sql: str, params=(), fetch=True):
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        raise RuntimeError("Database not configured. Set DATABASE_URL.")
+    # Short-lived connection per call: right for serverless + Neon's pooler.
+    with psycopg.connect(url, row_factory=dict_row, prepare_threshold=None, connect_timeout=10) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchall() if fetch and cur.description else []
+
+
+def _row(r):
+    """DB row -> the shape the rest of the app already expects (strings for dates/times)."""
+    out = dict(r)
+    for k in ("checkin_date", "checkin_ts"):
+        v = out.get(k)
+        if v is not None and not isinstance(v, str):
+            out[k] = v.isoformat()
+    return out
 
 
 def normalize_s_number(raw_value: str) -> str:
@@ -85,105 +113,36 @@ def require_supabase_data(result, context: str):
 
 
 def fetch_students():
-    client, _ = get_supabase_client()
-    page_size = 1000
-    rows = []
-    start = 0
-    while True:
-        result = (
-            client.table("students")
-            .select("name, s_number")
-            .order("name")
-            .range(start, start + page_size - 1)
-            .execute()
-        )
-        batch = require_supabase_data(result, "students select failed")
-        if not batch:
-            break
-        rows.extend(batch)
-        if len(batch) < page_size:
-            break
-        start += page_size
-    return rows
+    return [_row(r) for r in db_query("SELECT name, s_number FROM students ORDER BY name")]
 
 
 def fetch_attendance_for_date(date_str: str):
-    client, _ = get_supabase_client()
     date_str = normalize_date_string(date_str)
-    page_size = 1000
-    rows = []
-    start = 0
-    while True:
-        result = (
-            client.table("attendance")
-            .select("s_number, name, checkin_ts, photo_path")
-            .eq("checkin_date", date_str)
-            .order("checkin_ts")
-            .range(start, start + page_size - 1)
-            .execute()
-        )
-        batch = require_supabase_data(result, "attendance select failed")
-        if not batch:
-            break
-        rows.extend(batch)
-        if len(batch) < page_size:
-            break
-        start += page_size
-    return rows
+    return [_row(r) for r in db_query(
+        "SELECT s_number, name, checkin_ts, photo_path FROM attendance WHERE checkin_date = %s ORDER BY checkin_ts",
+        (date_str,),
+    )]
 
 
 def fetch_attendance_basic():
-    client, _ = get_supabase_client()
-    page_size = 1000
-    rows = []
-    start = 0
-    while True:
-        result = (
-            client.table("attendance")
-            .select("s_number, checkin_date")
-            .order("checkin_date", desc=True)
-            .order("s_number")
-            .range(start, start + page_size - 1)
-            .execute()
-        )
-        batch = require_supabase_data(result, "attendance analytics select failed")
-        if not batch:
-            break
-        rows.extend(batch)
-        if len(batch) < page_size:
-            break
-        start += page_size
-    return rows
+    return [_row(r) for r in db_query("SELECT s_number, checkin_date FROM attendance ORDER BY checkin_date DESC, s_number")]
 
 
 def fetch_attendance_rows(date_from: str = "", date_to: str = ""):
-    client, _ = get_supabase_client()
     date_from = normalize_date_string(date_from)
     date_to = normalize_date_string(date_to)
-
-    page_size = 1000
-    rows = []
-    start = 0
-    while True:
-        query = client.table("attendance").select("s_number, name, checkin_ts, checkin_date, photo_path")
-        if date_from:
-            query = query.gte("checkin_date", date_from)
-        if date_to:
-            query = query.lte("checkin_date", date_to)
-        query = (
-            query.order("checkin_date", desc=True)
-            .order("checkin_ts")
-            .range(start, start + page_size - 1)
-        )
-        result = query.execute()
-        batch = require_supabase_data(result, "attendance select failed")
-        if not batch:
-            break
-        rows.extend(batch)
-        if len(batch) < page_size:
-            break
-        start += page_size
-    return rows
+    where, params = [], []
+    if date_from:
+        where.append("checkin_date >= %s")
+        params.append(date_from)
+    if date_to:
+        where.append("checkin_date <= %s")
+        params.append(date_to)
+    sql = "SELECT s_number, name, checkin_ts, checkin_date, photo_path FROM attendance"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY checkin_date DESC, checkin_ts"
+    return [_row(r) for r in db_query(sql, tuple(params))]
 
 
 def get_today_str():
@@ -311,6 +270,12 @@ def _parse_date_param(value: str, field_name: str):
 
 @app.route("/api/report", methods=["GET"])
 def api_report():
+    # Optional shared key (set REPORT_API_KEY); the CO-OP Schedules app sends it as X-API-Key.
+    expected = os.getenv("REPORT_API_KEY")
+    if expected:
+        given = request.headers.get("X-API-Key") or request.args.get("key") or ""
+        if not hmac.compare_digest(given, expected):
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
     exclude = _parse_csv_set(request.args.get("exclude", ""))
     date_str = request.args.get("date", "")
     date_from = request.args.get("from", "")
@@ -488,15 +453,7 @@ def checkin():
         return jsonify({"ok": False, "error": "Missing or invalid photo"}), 400
 
     # Lookup roster
-    client, _ = get_supabase_client()
-    student_result = (
-        client.table("students")
-        .select("name, s_number")
-        .eq("s_number", s_number)
-        .limit(1)
-        .execute()
-    )
-    student_data = require_supabase_data(student_result, "student lookup failed")
+    student_data = db_query("SELECT name, s_number FROM students WHERE s_number = %s LIMIT 1", (s_number,))
     if not student_data:
         return jsonify({"ok": False, "error": "S-number not found"}), 404
 
@@ -505,15 +462,7 @@ def checkin():
 
     # Only first check-in counts today
     today = get_today_str()
-    existing_result = (
-        client.table("attendance")
-        .select("id")
-        .eq("s_number", s_number)
-        .eq("checkin_date", today)
-        .limit(1)
-        .execute()
-    )
-    existing_rows = require_supabase_data(existing_result, "attendance lookup failed")
+    existing_rows = db_query("SELECT id FROM attendance WHERE s_number = %s AND checkin_date = %s LIMIT 1", (s_number, today))
     if existing_rows:
         return jsonify({"ok": True, "status": "already", "first_name": fname})
 
@@ -523,18 +472,13 @@ def checkin():
 
     # Save photo locally and store a relative path in Supabase
     web_path = save_photo(photo_data_url, s_number)
-    insert_result = (
-        client.table("attendance")
-        .insert({
-            "s_number": s_number,
-            "name": full_name,
-            "checkin_ts": timestamp,
-            "checkin_date": today,
-            "photo_path": web_path,
-        })
-        .execute()
+    inserted = db_query(
+        """INSERT INTO attendance (s_number, name, checkin_ts, checkin_date, photo_path)
+           VALUES (%s, %s, %s, %s, %s) ON CONFLICT (s_number, checkin_date) DO NOTHING RETURNING id""",
+        (s_number, full_name, timestamp, today, web_path),
     )
-    require_supabase_data(insert_result, "attendance insert failed")
+    if not inserted:
+        return jsonify({"ok": True, "status": "already", "first_name": fname})
 
     return jsonify({"ok": True, "status": "new", "first_name": fname})
 
@@ -684,9 +628,8 @@ def add_roster():
         added.append({'Name': n, 's-number': s})
 
     if to_insert:
-        client, _ = get_supabase_client()
-        insert_result = client.table("students").insert(to_insert).execute()
-        require_supabase_data(insert_result, "students insert failed")
+        for row in to_insert:
+            db_query("INSERT INTO students (name, s_number) VALUES (%s, %s) ON CONFLICT (s_number) DO NOTHING", (row["name"], row["s_number"]), fetch=False)
 
     return jsonify({'ok': True, 'added': added})
 
