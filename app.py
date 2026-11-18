@@ -439,7 +439,7 @@ def checkin():
     now = datetime.now(ZoneInfo("America/Chicago"))
     timestamp = now.isoformat()
 
-    # Save photo locally and store a relative path in Supabase
+    # Store a small photo in Neon. A photo failure must not block check-in.
     # A photo problem must never block the check-in itself.
     try:
         web_path = save_photo(photo_data_url, s_number)
