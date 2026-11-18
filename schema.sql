@@ -14,3 +14,11 @@ CREATE TABLE IF NOT EXISTS attendance (
 	UNIQUE (s_number, checkin_date)   -- only the first check-in of the day counts
 );
 CREATE INDEX IF NOT EXISTS attendance_date_idx ON attendance (checkin_date);
+
+-- Check-in photos (small JPEGs). Served only to signed-in admins via /photo/<id>.
+CREATE TABLE IF NOT EXISTS checkin_photos (
+	id          bigserial PRIMARY KEY,
+	s_number    text NOT NULL,
+	data        bytea NOT NULL,
+	created_at  timestamptz NOT NULL DEFAULT now()
+);

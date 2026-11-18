@@ -24,9 +24,6 @@ if ENV_PATH.exists():
 if (ENV_DIR / "neon.env").exists():
     load_dotenv(ENV_DIR / "neon.env")
 # update from system env as well
-SUPABASE_PHOTOS_BUCKET = os.getenv("SUPABASE_PHOTOS_BUCKET", "checkin-photos")
-_supabase_client = None
-_supabase_url = None
 
 # ---- Admin password + session secret
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "abhiMora1!")
@@ -41,24 +38,7 @@ app = Flask(
 app.secret_key = SECRET_KEY
 
 
-def get_supabase_client():
-    global _supabase_client, _supabase_url
-    if _supabase_client and _supabase_url:
-        return _supabase_client, _supabase_url
-
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_ANON_KEY")
-    if not supabase_url or not supabase_key:
-        raise RuntimeError("Supabase not configured. Set SUPABASE_URL and SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY.")
-
-    from supabase import create_client  # only needed for photo uploads
-
-    _supabase_url = supabase_url
-    _supabase_client = create_client(supabase_url, supabase_key)
-    return _supabase_client, _supabase_url
-
-
-# ---- Postgres (Neon). Supabase is only used for photo storage now.
+# ---- Postgres (Neon) holds everything: roster, check-ins, photos.
 def db_query(sql: str, params=(), fetch=True):
     url = os.getenv("DATABASE_URL")
     if not url:
@@ -104,12 +84,6 @@ def format_timestamp(value) -> str:
         dt = dt.replace(tzinfo=ZoneInfo("America/Chicago"))
     local = dt.astimezone(ZoneInfo("America/Chicago"))
     return local.strftime("%Y-%m-%d %H:%M:%S %Z")
-
-
-def require_supabase_data(result, context: str):
-    if getattr(result, "error", None):
-        raise RuntimeError(f"{context}: {result.error}")
-    return result.data or []
 
 
 def fetch_students():
@@ -167,35 +141,30 @@ def first_name(full_name: str) -> str:
 
 
 def save_photo(data_url: str, s_number: str) -> str:
-    client, supabase_url = get_supabase_client()
+    """Store a small JPEG in Postgres; returns the admin-only URL for it."""
     _, b64data = data_url.split(",", 1)
-    binary = base64.b64decode(b64data)
-    pil_img = Image.open(io.BytesIO(binary))
-
-    # Resize to keep uploads light
-    max_w, max_h = 240, 180
-    pil_img.thumbnail((max_w, max_h))
-
+    pil_img = Image.open(io.BytesIO(base64.b64decode(b64data)))
+    pil_img.thumbnail((240, 180))
     buffer = io.BytesIO()
-    pil_img.save(buffer, format="PNG")
-    buffer.seek(0)
-
-    date_str = get_today_str()
-    ts = datetime.now(ZoneInfo("America/Chicago")).strftime("%H%M%S%f")
-    filename = f"{s_number}_{ts}.png"
-    storage_path = f"{date_str}/{filename}"
-
-    upload_result = client.storage.from_(SUPABASE_PHOTOS_BUCKET).upload(
-        storage_path,
-        buffer.getvalue(),
-        {"content-type": "image/png", "upsert": "true"},
+    pil_img.convert("RGB").save(buffer, format="JPEG", quality=70)
+    row = db_query(
+        "INSERT INTO checkin_photos (s_number, data) VALUES (%s, %s) RETURNING id",
+        (s_number, buffer.getvalue()),
     )
-    if getattr(upload_result, "error", None):
-        raise RuntimeError(f"photo upload failed: {upload_result.error}")
+    return f"/photo/{row[0]['id']}"
 
-    base_url = supabase_url.rstrip("/")
-    public_url = f"{base_url}/storage/v1/object/public/{SUPABASE_PHOTOS_BUCKET}/{storage_path}"
-    return public_url
+
+@app.route("/photo/<int:photo_id>")
+def photo(photo_id: int):
+    # Students are minors: photos are only for signed-in admins, never public.
+    if not is_authed():
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+    rows = db_query("SELECT data FROM checkin_photos WHERE id = %s", (photo_id,))
+    if not rows:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    resp = send_file(io.BytesIO(bytes(rows[0]["data"])), mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "private, max-age=86400"
+    return resp
 
 
 def calculate_analytics(students, attendance_rows, available_dates):
@@ -471,7 +440,12 @@ def checkin():
     timestamp = now.isoformat()
 
     # Save photo locally and store a relative path in Supabase
-    web_path = save_photo(photo_data_url, s_number)
+    # A photo problem must never block the check-in itself.
+    try:
+        web_path = save_photo(photo_data_url, s_number)
+    except Exception as exc:  # noqa: BLE001
+        app.logger.warning("photo not saved for %s: %s", s_number, exc)
+        web_path = None
     inserted = db_query(
         """INSERT INTO attendance (s_number, name, checkin_ts, checkin_date, photo_path)
            VALUES (%s, %s, %s, %s, %s) ON CONFLICT (s_number, checkin_date) DO NOTHING RETURNING id""",
